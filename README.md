@@ -86,10 +86,11 @@ Chunks are 64 KiB each.
 ## Project Structure
 
 ```
-src/
-├── protocol.rs    – Message/Frame/FileChunk enums, read/write helpers
-├── listener.rs    – egui GUI (shell + file manager)
-└── target.rs      – Headless console target (reconnect loop)
+├─ Cargo.toml
+└─ src/
+    ├─ protocol.rs    – Message/Frame/FileChunk enums, read/write helpers
+    ├─ listener.rs    – egui GUI (shell + file manager)
+    └─ target.rs      – Headless console target (reconnect loop)
 ```
 
 ### Dependencies
