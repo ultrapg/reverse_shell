@@ -4,6 +4,12 @@ use std::net::TcpStream;
 
 pub const CHUNK_SIZE: usize = 65536;
 
+#[derive(Debug, PartialEq)]
+pub enum ParseError {
+    NeedMore,
+    Invalid(String),
+}
+
 // ── JSON control messages ──
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +64,47 @@ pub enum Frame {
 
 const FT_MSG: u8 = 0x00;
 const FT_CHUNK: u8 = 0x01;
+
+/// Try to parse one frame from a byte slice (non-consuming).
+pub fn parse_frame(data: &[u8]) -> Result<(Frame, usize), ParseError> {
+    if data.is_empty() {
+        return Err(ParseError::NeedMore);
+    }
+    match data[0] {
+        FT_MSG => {
+            if data.len() < 5 {
+                return Err(ParseError::NeedMore);
+            }
+            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            if data.len() < 5 + len {
+                return Err(ParseError::NeedMore);
+            }
+            let msg: Message = serde_json::from_slice(&data[5..5 + len])
+                .map_err(|e| ParseError::Invalid(e.to_string()))?;
+            Ok((Frame::Msg(msg), 5 + len))
+        }
+        FT_CHUNK => {
+            if data.len() < 22 {
+                return Err(ParseError::NeedMore);
+            }
+            let total_size = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            let offset = u64::from_le_bytes(data[9..17].try_into().unwrap());
+            let is_last = data[17] != 0;
+            let dlen = u32::from_le_bytes(data[18..22].try_into().unwrap()) as usize;
+            if data.len() < 22 + dlen {
+                return Err(ParseError::NeedMore);
+            }
+            let chunk = FileChunk {
+                total_size,
+                offset,
+                is_last,
+                data: data[22..22 + dlen].to_vec(),
+            };
+            Ok((Frame::Chunk(chunk), 22 + dlen))
+        }
+        b => Err(ParseError::Invalid(format!("bad frame tag 0x{:02x}", b))),
+    }
+}
 
 /// Read one frame from the stream (blocking).
 pub fn read_frame(stream: &mut TcpStream) -> io::Result<Frame> {
